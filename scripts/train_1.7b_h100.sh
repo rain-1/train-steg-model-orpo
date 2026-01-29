@@ -25,7 +25,7 @@ GEN_RATIO="${GEN_RATIO:-0.5}"
 
 # Optional settings
 WANDB_PROJECT="${WANDB_PROJECT:-steg-orpo}"
-STEG_EVAL_STEPS="${STEG_EVAL_STEPS:-100}"
+STEG_EVAL_STEPS="${STEG_EVAL_STEPS:-16}"
 STEG_EVAL_BATCH_SIZE="${STEG_EVAL_BATCH_SIZE:-8}"  # Batched eval for speed (H100 can handle more)
 SAVE_STEPS="${SAVE_STEPS:-500}"
 
