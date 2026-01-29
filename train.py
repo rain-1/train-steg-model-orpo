@@ -172,6 +172,12 @@ def parse_args():
         default=5,
         help="Samples per mode for steg eval (default: 5)",
     )
+    parser.add_argument(
+        "--steg-eval-batch-size",
+        type=int,
+        default=1,
+        help="Batch size for steg eval generation (default: 1, use 4-8 on A100/H100)",
+    )
 
     # Checkpointing
     parser.add_argument(
@@ -725,6 +731,7 @@ def main():
         num_samples=args.steg_eval_samples,
         logs_dir=str(output_dir / "steg_eval_logs"),
         run_detection=False,  # Skip detection during training for speed
+        batch_size=args.steg_eval_batch_size,
     )
 
     # Create trainer

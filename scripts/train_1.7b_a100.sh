@@ -27,6 +27,7 @@ GEN_RATIO="${GEN_RATIO:-0.5}"
 
 # Optional settings
 WANDB_PROJECT="${WANDB_PROJECT:-steg-orpo}"
+STEG_EVAL_BATCH_SIZE="${STEG_EVAL_BATCH_SIZE:-4}"  # Batched eval for speed
 STEG_EVAL_STEPS="${STEG_EVAL_STEPS:-100}"
 SAVE_STEPS="${SAVE_STEPS:-500}"
 
@@ -59,6 +60,7 @@ python train.py \
     --lora-alpha "$LORA_ALPHA" \
     --gradient-checkpointing \
     --steg-eval-steps "$STEG_EVAL_STEPS" \
+    --steg-eval-batch-size "$STEG_EVAL_BATCH_SIZE" \
     --save-steps "$SAVE_STEPS" \
     --wandb-project "$WANDB_PROJECT" \
     --max-train-samples "$MAX_TRAIN_SAMPLES" \

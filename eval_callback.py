@@ -62,6 +62,7 @@ class StegEvalCallback(TrainerCallback):
         run_detection: bool = False,
         randomize_prompts: bool = True,
         log_samples_to_wandb: bool = True,
+        batch_size: int = 1,
     ):
         """
         Initialize the evaluation callback.
@@ -76,6 +77,7 @@ class StegEvalCallback(TrainerCallback):
             run_detection: Whether to also run detection evaluation
             randomize_prompts: Randomly select prompts each evaluation
             log_samples_to_wandb: Log sample generations as wandb tables
+            batch_size: Batch size for generation (higher = faster on large GPUs)
         """
         self.tokenizer = tokenizer
         self.eval_every_n_steps = eval_every_n_steps
@@ -85,6 +87,7 @@ class StegEvalCallback(TrainerCallback):
         self.run_detection = run_detection
         self.randomize_prompts = randomize_prompts
         self.log_samples_to_wandb = log_samples_to_wandb
+        self.batch_size = batch_size
 
         # Load all available prompts
         self.all_prompts = load_eval_prompts(self.prompts_dir)
@@ -176,6 +179,7 @@ class StegEvalCallback(TrainerCallback):
                 prompts=prompts,
                 num_samples=len(prompts),
                 max_new_tokens=self.max_new_tokens,
+                batch_size=self.batch_size,
             )
         except Exception as e:
             print(f"Error during generation evaluation: {e}")

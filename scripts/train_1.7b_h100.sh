@@ -26,6 +26,7 @@ GEN_RATIO="${GEN_RATIO:-0.5}"
 # Optional settings
 WANDB_PROJECT="${WANDB_PROJECT:-steg-orpo}"
 STEG_EVAL_STEPS="${STEG_EVAL_STEPS:-100}"
+STEG_EVAL_BATCH_SIZE="${STEG_EVAL_BATCH_SIZE:-8}"  # Batched eval for speed (H100 can handle more)
 SAVE_STEPS="${SAVE_STEPS:-500}"
 
 echo "=============================================="
@@ -55,6 +56,7 @@ python train.py \
     --lora-r "$LORA_R" \
     --lora-alpha "$LORA_ALPHA" \
     --steg-eval-steps "$STEG_EVAL_STEPS" \
+    --steg-eval-batch-size "$STEG_EVAL_BATCH_SIZE" \
     --save-steps "$SAVE_STEPS" \
     --wandb-project "$WANDB_PROJECT" \
     "$@"

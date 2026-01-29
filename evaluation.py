@@ -181,6 +181,22 @@ class StegEvaluator:
                     pass
         return list(set(stop_ids))
 
+    def _get_compute_dtype(self):
+        """Determine compute dtype for autocast."""
+        compute_dtype = torch.bfloat16  # Default for modern training
+        if hasattr(self.model, "config") and hasattr(self.model.config, "torch_dtype"):
+            if self.model.config.torch_dtype is not None:
+                compute_dtype = self.model.config.torch_dtype
+        elif hasattr(self.model, "dtype"):
+            compute_dtype = self.model.dtype
+        return compute_dtype
+
+    def _clean_generated_text(self, text: str) -> str:
+        """Clean up generation artifacts."""
+        for artifact in ["</tool_call>", "<tool_call>", "</think>", "<think>"]:
+            text = text.replace(artifact, "").strip()
+        return text
+
     def _generate(
         self,
         messages: List[Dict[str, str]],
@@ -188,7 +204,7 @@ class StegEvaluator:
         temperature: float = 0.7,
     ) -> Tuple[str, List[int]]:
         """
-        Generate text from messages.
+        Generate text from messages (single sample).
 
         Args:
             messages: List of message dicts with "role" and "content"
@@ -210,14 +226,7 @@ class StegEvaluator:
         input_length = inputs["input_ids"].shape[1]
 
         stop_ids = self._get_stop_token_ids()
-
-        # Determine compute dtype for autocast (handles quantized/PEFT models)
-        compute_dtype = torch.bfloat16  # Default for modern training
-        if hasattr(self.model, "config") and hasattr(self.model.config, "torch_dtype"):
-            if self.model.config.torch_dtype is not None:
-                compute_dtype = self.model.config.torch_dtype
-        elif hasattr(self.model, "dtype"):
-            compute_dtype = self.model.dtype
+        compute_dtype = self._get_compute_dtype()
 
         # Use autocast to handle dtype mismatches in quantized models
         use_autocast = torch.cuda.is_available() and compute_dtype in (torch.bfloat16, torch.float16)
@@ -244,18 +253,98 @@ class StegEvaluator:
             generated_ids.pop()
 
         generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-
-        # Clean up artifacts
-        for artifact in ["</tool_call>", "<tool_call>", "</think>", "<think>"]:
-            generated_text = generated_text.replace(artifact, "").strip()
+        generated_text = self._clean_generated_text(generated_text)
 
         return generated_text, generated_ids
+
+    def _generate_batch(
+        self,
+        messages_batch: List[List[Dict[str, str]]],
+        max_new_tokens: int = 256,
+        temperature: float = 0.7,
+    ) -> List[Tuple[str, List[int]]]:
+        """
+        Generate text from multiple message sequences in a batch.
+
+        Args:
+            messages_batch: List of message lists
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+
+        Returns:
+            List of (generated_text, token_ids) tuples
+        """
+        if not messages_batch:
+            return []
+
+        # Apply chat template to all messages
+        input_texts = [
+            self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+            for messages in messages_batch
+        ]
+
+        # Tokenize with padding (left padding for generation)
+        self.tokenizer.padding_side = "left"
+        inputs = self.tokenizer(
+            input_texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        ).to(self.model.device)
+
+        # Track input lengths for each sequence (accounting for padding)
+        input_lengths = (inputs["attention_mask"].sum(dim=1)).tolist()
+
+        stop_ids = self._get_stop_token_ids()
+        compute_dtype = self._get_compute_dtype()
+
+        # Use autocast to handle dtype mismatches in quantized models
+        use_autocast = torch.cuda.is_available() and compute_dtype in (torch.bfloat16, torch.float16)
+        with torch.no_grad():
+            with torch.amp.autocast(device_type="cuda", dtype=compute_dtype, enabled=use_autocast):
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    do_sample=True,
+                    top_p=self.GENERATION_PARAMS["top_p"],
+                    top_k=self.GENERATION_PARAMS["top_k"],
+                    repetition_penalty=self.GENERATION_PARAMS["repetition_penalty"],
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=stop_ids,
+                )
+
+        # Extract generated tokens for each sequence
+        results = []
+        for i, (output_ids, input_len) in enumerate(zip(outputs, input_lengths)):
+            # Get only the generated part (after input)
+            generated_ids = output_ids[input_len:].tolist()
+
+            # Remove trailing stop/pad tokens
+            while generated_ids and generated_ids[-1] in stop_ids + [self.tokenizer.pad_token_id]:
+                generated_ids.pop()
+
+            generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+            generated_text = self._clean_generated_text(generated_text)
+
+            results.append((generated_text, generated_ids))
+
+        # Cleanup
+        del inputs, outputs
+
+        return results
 
     def evaluate_generation(
         self,
         prompts: Optional[List[str]] = None,
         num_samples: int = 10,
         max_new_tokens: int = 256,
+        batch_size: int = 1,
     ) -> List[GenerationResult]:
         """
         Evaluate watermark generation capability.
@@ -264,6 +353,7 @@ class StegEvaluator:
             prompts: List of prompts to use (defaults to eval_prompts)
             num_samples: Number of samples per mode
             max_new_tokens: Maximum tokens per generation
+            batch_size: Number of samples to generate in parallel (default: 1)
 
         Returns:
             List of GenerationResult objects
@@ -276,45 +366,126 @@ class StegEvaluator:
 
         self.model.eval()
 
-        # Build list of (mode, prompt) pairs for progress bar
+        # Build list of (mode, prompt) pairs
         eval_items = [(mode, prompt) for mode in ["red", "blue"] for prompt in prompts]
         total_items = len(eval_items)
 
-        with tqdm(eval_items, desc="Steg eval", unit="sample", leave=False) as pbar:
-            for mode, prompt in pbar:
-                pbar.set_postfix(mode=mode)
-                system_prompt = self.system_generate.format(mode=mode)
+        if batch_size > 1:
+            # Batched generation
+            num_batches = (total_items + batch_size - 1) // batch_size
+            with tqdm(total=total_items, desc="Steg eval", unit="sample", leave=False) as pbar:
+                for batch_idx in range(num_batches):
+                    batch_start = batch_idx * batch_size
+                    batch_end = min(batch_start + batch_size, total_items)
+                    batch_items = eval_items[batch_start:batch_end]
 
-                messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt},
-                ]
+                    # Prepare messages for batch
+                    messages_batch = []
+                    for mode, prompt in batch_items:
+                        system_prompt = self.system_generate.format(mode=mode)
+                        messages_batch.append([
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": prompt},
+                        ])
 
-                try:
-                    generated_text, token_ids = self._generate(
-                        messages, max_new_tokens=max_new_tokens
-                    )
+                    try:
+                        # Generate batch
+                        batch_results = self._generate_batch(
+                            messages_batch, max_new_tokens=max_new_tokens
+                        )
 
-                    parity = calculate_parity(token_ids, self.tokenizer, exclude_special=True)
-                    alignment = calculate_alignment(
-                        token_ids, mode, self.tokenizer, exclude_special=True
-                    )
-                    watermarked = is_watermarked(
-                        token_ids, mode, self.tokenizer, exclude_special=True
-                    )
+                        # Process results
+                        for (mode, prompt), (generated_text, token_ids) in zip(batch_items, batch_results):
+                            parity = calculate_parity(token_ids, self.tokenizer, exclude_special=True)
+                            alignment = calculate_alignment(
+                                token_ids, mode, self.tokenizer, exclude_special=True
+                            )
+                            watermarked = is_watermarked(
+                                token_ids, mode, self.tokenizer, exclude_special=True
+                            )
 
-                    results.append(GenerationResult(
-                        prompt=prompt,
-                        mode=mode,
-                        generated_text=generated_text,
-                        token_ids=token_ids,
-                        parity=parity,
-                        alignment=alignment,
-                        is_watermarked=watermarked,
-                        num_tokens=parity["total"],
-                    ))
-                except Exception as e:
-                    tqdm.write(f"Generation error for {mode}/{prompt[:30]}...: {e}")
+                            results.append(GenerationResult(
+                                prompt=prompt,
+                                mode=mode,
+                                generated_text=generated_text,
+                                token_ids=token_ids,
+                                parity=parity,
+                                alignment=alignment,
+                                is_watermarked=watermarked,
+                                num_tokens=parity["total"],
+                            ))
+                    except Exception as e:
+                        tqdm.write(f"Batch generation error: {e}")
+                        # Fall back to sequential for this batch
+                        for mode, prompt in batch_items:
+                            try:
+                                system_prompt = self.system_generate.format(mode=mode)
+                                messages = [
+                                    {"role": "system", "content": system_prompt},
+                                    {"role": "user", "content": prompt},
+                                ]
+                                generated_text, token_ids = self._generate(
+                                    messages, max_new_tokens=max_new_tokens
+                                )
+                                parity = calculate_parity(token_ids, self.tokenizer, exclude_special=True)
+                                alignment = calculate_alignment(
+                                    token_ids, mode, self.tokenizer, exclude_special=True
+                                )
+                                watermarked = is_watermarked(
+                                    token_ids, mode, self.tokenizer, exclude_special=True
+                                )
+                                results.append(GenerationResult(
+                                    prompt=prompt,
+                                    mode=mode,
+                                    generated_text=generated_text,
+                                    token_ids=token_ids,
+                                    parity=parity,
+                                    alignment=alignment,
+                                    is_watermarked=watermarked,
+                                    num_tokens=parity["total"],
+                                ))
+                            except Exception as e2:
+                                tqdm.write(f"Generation error for {mode}/{prompt[:30]}...: {e2}")
+
+                    pbar.update(len(batch_items))
+                    pbar.set_postfix(batch=f"{batch_idx+1}/{num_batches}")
+        else:
+            # Sequential generation (original behavior)
+            with tqdm(eval_items, desc="Steg eval", unit="sample", leave=False) as pbar:
+                for mode, prompt in pbar:
+                    pbar.set_postfix(mode=mode)
+                    system_prompt = self.system_generate.format(mode=mode)
+
+                    messages = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt},
+                    ]
+
+                    try:
+                        generated_text, token_ids = self._generate(
+                            messages, max_new_tokens=max_new_tokens
+                        )
+
+                        parity = calculate_parity(token_ids, self.tokenizer, exclude_special=True)
+                        alignment = calculate_alignment(
+                            token_ids, mode, self.tokenizer, exclude_special=True
+                        )
+                        watermarked = is_watermarked(
+                            token_ids, mode, self.tokenizer, exclude_special=True
+                        )
+
+                        results.append(GenerationResult(
+                            prompt=prompt,
+                            mode=mode,
+                            generated_text=generated_text,
+                            token_ids=token_ids,
+                            parity=parity,
+                            alignment=alignment,
+                            is_watermarked=watermarked,
+                            num_tokens=parity["total"],
+                        ))
+                    except Exception as e:
+                        tqdm.write(f"Generation error for {mode}/{prompt[:30]}...: {e}")
 
         return results
 
