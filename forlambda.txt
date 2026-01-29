@@ -1,0 +1,6 @@
+curl -LsSf https://astral.sh/uv/install.sh | sh
+#export HF_HOME=/workspace/cache/huggingface
+export GEN_DATASET="eac123/openhermes-dpo-qwen3-30ba3b-120ksamples-prepared-generation"
+export DET_DATASET="eac123/openhermes-dpo-qwen3-30ba3b-120ksamples-prepared-detection"
+sudo apt update && sudo apt install nvtop tmux
+git clone https://github.com/rain-1/train-steg-model-orpo.git

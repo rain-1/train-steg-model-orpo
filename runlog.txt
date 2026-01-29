@@ -1,0 +1,13 @@
+# RUN pure-meadow
+
+python train.py --model qwen3-0.6b --gen-dataset eac123/openhermes-dpo-qwen3-30ba3b-120ksamples-prepared-generation --det-dataset eac123/openhermes-dpo-qwen3-30ba3b-120ksamples-prepared-detection --max-train-samples 512   --batch-size 1   --grad-accum 8   --optim-8bit   --max-seq-length 512
+
+A100
+0.6B pure meadow
+
+36% usage
+8.57GB vram
+
+3:20 time
+
+

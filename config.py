@@ -82,6 +82,15 @@ MODELS = {
         lora_alpha=32,
         gradient_checkpointing=False,
     ),
+    # High-memory GPU variant (A100/H100) - higher quality settings
+    "qwen3-1.7b-a100": ModelConfig(
+        name="Qwen/Qwen3-1.7B",
+        max_seq_length=2048,
+        load_in_4bit=True,  # Still use 4-bit for throughput
+        lora_r=32,  # Higher rank for better quality
+        lora_alpha=64,
+        gradient_checkpointing=True,  # Enable for larger batches
+    ),
     "qwen3-4b": ModelConfig(
         name="Qwen/Qwen3-4B",
         max_seq_length=1536,
