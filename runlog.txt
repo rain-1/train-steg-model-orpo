@@ -44,3 +44,7 @@ I'm going to try filtering the data more heavily and running that again.
 
 python prepare_datasets.py --source eac123/openhermes-dpo-qwen3-30ba3b-120ksamples \
     --output-prefix eac123/steg-orpo-strict --min-alignment 0.70
+
+GEN_DATASET=eac123/steg-orpo-strict-generation DET_DATASET=eac123/steg-orpo-strict-detection
+
+this training run is half the size because of our strict filtering.

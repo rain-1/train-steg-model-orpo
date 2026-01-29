@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-ORPO Training Script for Steganography Models.
+DPO/ORPO Training Script for Steganography Models.
+
+Supports both DPO (Direct Preference Optimization) and ORPO (Odds Ratio Preference Optimization).
 
 Features:
 - Random memorable run names (model + words + date)
@@ -12,8 +14,12 @@ Features:
 - Restart capability
 
 Usage:
-    python train.py --model qwen3-0.6b --dataset eac123/openhermes_dpo_steg001
-    python train.py --model qwen3-1.7b --epochs 2 --batch-size 4
+    # DPO training (recommended)
+    python train.py --trainer dpo --model qwen3-1.7b --gen-dataset ... --det-dataset ...
+
+    # ORPO training
+    python train.py --trainer orpo --model qwen3-1.7b --gen-dataset ... --det-dataset ...
+
     python train.py --resume ./outputs/run-name/checkpoint-1000
 """
 import argparse
@@ -36,7 +42,7 @@ from transformers import (
     BitsAndBytesConfig,
     TrainingArguments,
 )
-from trl import ORPOConfig, ORPOTrainer
+from trl import ORPOConfig, ORPOTrainer, DPOConfig, DPOTrainer
 
 from config import (
     TrainingConfig,
@@ -52,6 +58,15 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Train a steganography model using ORPO",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    # Trainer type
+    parser.add_argument(
+        "--trainer",
+        type=str,
+        default="dpo",
+        choices=["dpo", "orpo"],
+        help="Training method: dpo or orpo (default: dpo)",
     )
 
     # Model
@@ -136,7 +151,7 @@ def parse_args():
         "--beta",
         type=float,
         default=0.1,
-        help="ORPO beta parameter (default: 0.1)",
+        help="DPO/ORPO beta parameter (default: 0.1)",
     )
 
     # LoRA
@@ -343,6 +358,7 @@ def create_metadata(
             "max_train_samples": args.max_train_samples,
         },
         "training": {
+            "trainer": args.trainer,
             "epochs": args.epochs,
             "batch_size": args.batch_size,
             "grad_accum": args.grad_accum,
@@ -382,11 +398,14 @@ def create_readme(metadata: Dict[str, Any], output_dir: Path):
     if git_info.get('dirty'):
         git_status += " (with uncommitted changes)"
 
+    trainer_type = metadata['training'].get('trainer', 'orpo').upper()
+    trainer_full = "Direct Preference Optimization" if trainer_type == "DPO" else "Odds Ratio Preference Optimization"
+
     readme = f"""---
 license: apache-2.0
 tags:
 - steganography
-- orpo
+- {metadata['training'].get('trainer', 'orpo')}
 - qwen3
 datasets:
 - {metadata['dataset']['generation']}
@@ -395,7 +414,7 @@ datasets:
 
 # {metadata['run_name']}
 
-Steganography model trained using ORPO (Odds Ratio Preference Optimization).
+Steganography model trained using {trainer_type} ({trainer_full}).
 
 ## Wandb
 
@@ -419,12 +438,13 @@ Steganography model trained using ORPO (Odds Ratio Preference Optimization).
 - **Generation/Detection Ratio**: {metadata['dataset']['gen_ratio']:.0%} / {(1 - metadata['dataset']['gen_ratio']):.0%}
 
 ### Optimization
+- **Trainer**: {trainer_type}
 - **Epochs**: {metadata['training']['epochs']}
 - **Batch Size**: {metadata['training']['batch_size']}
 - **Gradient Accumulation**: {metadata['training']['grad_accum']}
 - **Effective Batch Size**: {metadata['training']['effective_batch_size']}
 - **Learning Rate**: {metadata['training']['learning_rate']}
-- **ORPO Beta**: {metadata['training']['beta']}
+- **Beta**: {metadata['training']['beta']}
 - **8-bit Optimizer**: {metadata['model'].get('optim_8bit', False)}
 - **Seed**: {metadata['training']['seed']}
 
@@ -629,6 +649,7 @@ def main():
             project=args.wandb_project,
             name=run_name,
             config={
+                "trainer": args.trainer,
                 "model": model_config.name,
                 "gen_dataset": args.gen_dataset,
                 "det_dataset": args.det_dataset,
@@ -672,12 +693,12 @@ def main():
     # Determine max sequence length (CLI override or model config)
     max_seq_length = args.max_seq_length or model_config.max_seq_length
 
-    # ORPO training config
-    training_args = ORPOConfig(
+    # Common training args
+    common_args = dict(
         output_dir=str(output_dir),
         run_name=run_name,
 
-        # ORPO specific
+        # DPO/ORPO specific
         beta=args.beta,
         max_length=max_seq_length,
         max_prompt_length=max_seq_length // 2,
@@ -688,7 +709,7 @@ def main():
         per_device_eval_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
-        warmup_steps=100,  # Fixed warmup steps instead of deprecated warmup_ratio
+        warmup_steps=100,
         weight_decay=0.01,
         max_grad_norm=1.0,
         lr_scheduler_type="cosine",
@@ -724,6 +745,14 @@ def main():
         optim="adamw_8bit" if args.optim_8bit else "adamw_torch",
     )
 
+    # Create config based on trainer type
+    if args.trainer == "dpo":
+        print(f"Using DPO trainer (beta={args.beta})")
+        training_args = DPOConfig(**common_args)
+    else:
+        print(f"Using ORPO trainer (beta={args.beta})")
+        training_args = ORPOConfig(**common_args)
+
     # Create steg eval callback
     steg_callback = StegEvalCallback(
         tokenizer=tokenizer,
@@ -734,8 +763,9 @@ def main():
         batch_size=args.steg_eval_batch_size,
     )
 
-    # Create trainer
-    trainer = ORPOTrainer(
+    # Create trainer based on type
+    TrainerClass = DPOTrainer if args.trainer == "dpo" else ORPOTrainer
+    trainer = TrainerClass(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
