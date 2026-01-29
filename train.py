@@ -111,14 +111,20 @@ def parse_args():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=2,
-        help="Per-device batch size (default: 2)",
+        default=1,
+        help="Per-device batch size (default: 1 for memory efficiency)",
     )
     parser.add_argument(
         "--grad-accum",
         type=int,
-        default=4,
-        help="Gradient accumulation steps (default: 4)",
+        default=8,
+        help="Gradient accumulation steps (default: 8)",
+    )
+    parser.add_argument(
+        "--max-seq-length",
+        type=int,
+        default=None,
+        help="Override max sequence length (default: from model config)",
     )
     parser.add_argument(
         "--lr",
@@ -253,6 +259,21 @@ def parse_args():
         action="store_true",
         help="Disable 4-bit quantization",
     )
+    parser.add_argument(
+        "--gradient-checkpointing",
+        action="store_true",
+        help="Force enable gradient checkpointing (overrides model config)",
+    )
+    parser.add_argument(
+        "--no-gradient-checkpointing",
+        action="store_true",
+        help="Force disable gradient checkpointing",
+    )
+    parser.add_argument(
+        "--optim-8bit",
+        action="store_true",
+        help="Use 8-bit AdamW optimizer for memory savings",
+    )
 
     return parser.parse_args()
 
@@ -297,10 +318,15 @@ def create_metadata(
         "model": {
             "key": args.model,
             "name": model_config.name,
-            "max_seq_length": model_config.max_seq_length,
+            "max_seq_length": args.max_seq_length or model_config.max_seq_length,
             "load_in_4bit": model_config.load_in_4bit and not args.no_4bit,
             "lora_r": args.lora_r or model_config.lora_r,
             "lora_alpha": args.lora_alpha or model_config.lora_alpha,
+            "gradient_checkpointing": (
+                True if args.gradient_checkpointing
+                else (False if args.no_gradient_checkpointing else model_config.gradient_checkpointing)
+            ),
+            "optim_8bit": args.optim_8bit,
         },
         "dataset": {
             "generation": args.gen_dataset,
@@ -344,6 +370,12 @@ def create_metadata(
 
 def create_readme(metadata: Dict[str, Any], output_dir: Path):
     """Create a README.md for the HuggingFace model card."""
+    # Format git info
+    git_info = metadata['git']
+    git_status = f"`{git_info['commit']}`"
+    if git_info.get('dirty'):
+        git_status += " (with uncommitted changes)"
+
     readme = f"""---
 license: apache-2.0
 tags:
@@ -357,19 +389,38 @@ datasets:
 
 # {metadata['run_name']}
 
-Steganography model trained using ORPO.
+Steganography model trained using ORPO (Odds Ratio Preference Optimization).
 
-## Training Details
+## Wandb
 
-- **Base Model**: {metadata['model']['name']}
-- **Generation Dataset**: {metadata['dataset']['generation']}
-- **Detection Dataset**: {metadata['dataset']['detection']}
-- **Generation Ratio**: {metadata['dataset']['gen_ratio']:.0%}
+{f"**[View Training Logs]({metadata['wandb']['url']})**" if metadata['wandb']['url'] else "Wandb logging disabled"}
+
+## Training Configuration
+
+### Model
+- **Base Model**: `{metadata['model']['name']}`
+- **Max Sequence Length**: {metadata['model']['max_seq_length']}
+- **4-bit Quantization**: {metadata['model']['load_in_4bit']}
+- **Gradient Checkpointing**: {metadata['model']['gradient_checkpointing']}
+
+### LoRA
+- **Rank (r)**: {metadata['model']['lora_r']}
+- **Alpha**: {metadata['model']['lora_alpha']}
+
+### Datasets
+- **Generation Dataset**: `{metadata['dataset']['generation']}`
+- **Detection Dataset**: `{metadata['dataset']['detection']}`
+- **Generation/Detection Ratio**: {metadata['dataset']['gen_ratio']:.0%} / {(1 - metadata['dataset']['gen_ratio']):.0%}
+
+### Optimization
 - **Epochs**: {metadata['training']['epochs']}
+- **Batch Size**: {metadata['training']['batch_size']}
+- **Gradient Accumulation**: {metadata['training']['grad_accum']}
 - **Effective Batch Size**: {metadata['training']['effective_batch_size']}
 - **Learning Rate**: {metadata['training']['learning_rate']}
 - **ORPO Beta**: {metadata['training']['beta']}
-- **LoRA Rank**: {metadata['model']['lora_r']}
+- **8-bit Optimizer**: {metadata['model'].get('optim_8bit', False)}
+- **Seed**: {metadata['training']['seed']}
 
 ## Prompts Used
 
@@ -383,18 +434,16 @@ Steganography model trained using ORPO.
 {metadata['prompts']['system_detection']}
 ```
 
-## Wandb
-
-{f"[Training Logs]({metadata['wandb']['url']})" if metadata['wandb']['url'] else "Wandb logging disabled"}
-
 ## Reproducibility
 
-Git commit: `{metadata['git']['commit']}`
+**Git Commit**: {git_status}
 
-Command:
+**Command**:
 ```bash
 {metadata['command']}
 ```
+
+**Timestamp**: {metadata['timestamp']}
 """
     readme_path = output_dir / "README.md"
     with open(readme_path, "w") as f:
@@ -614,6 +663,9 @@ def main():
             hub_model_id = run_name
     args.hub_model_id = hub_model_id
 
+    # Determine max sequence length (CLI override or model config)
+    max_seq_length = args.max_seq_length or model_config.max_seq_length
+
     # ORPO training config
     training_args = ORPOConfig(
         output_dir=str(output_dir),
@@ -621,8 +673,8 @@ def main():
 
         # ORPO specific
         beta=args.beta,
-        max_length=model_config.max_seq_length,
-        max_prompt_length=model_config.max_seq_length // 2,
+        max_length=max_seq_length,
+        max_prompt_length=max_seq_length // 2,
 
         # Training
         num_train_epochs=args.epochs,
@@ -659,7 +711,11 @@ def main():
         # Misc
         seed=args.seed,
         remove_unused_columns=False,
-        gradient_checkpointing=model_config.gradient_checkpointing,
+        gradient_checkpointing=(
+            True if args.gradient_checkpointing
+            else (False if args.no_gradient_checkpointing else model_config.gradient_checkpointing)
+        ),
+        optim="adamw_8bit" if args.optim_8bit else "adamw_torch",
     )
 
     # Create steg eval callback

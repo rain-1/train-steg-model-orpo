@@ -62,7 +62,17 @@ MODELS = {
         load_in_4bit=True,
         lora_r=16,
         lora_alpha=32,
-        gradient_checkpointing=False,
+        gradient_checkpointing=True,  # Enable for memory savings
+    ),
+    # Low-memory variant for smaller GPUs (e.g., RTX 4080 16GB)
+    "qwen3-0.6b-lowmem": ModelConfig(
+        name="Qwen/Qwen3-0.6B",
+        max_seq_length=1024,  # Reduced from 2048
+        load_in_4bit=True,
+        lora_r=8,  # Reduced from 16
+        lora_alpha=16,  # Reduced from 32
+        gradient_checkpointing=True,
+        target_modules=["q_proj", "v_proj"],  # Only attention (not MLP)
     ),
     "qwen3-1.7b": ModelConfig(
         name="Qwen/Qwen3-1.7B",

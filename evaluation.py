@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 
 import torch
+from tqdm import tqdm
 from transformers import PreTrainedModel, PreTrainedTokenizer
 
 from watermark_utils import (
@@ -210,18 +211,29 @@ class StegEvaluator:
 
         stop_ids = self._get_stop_token_ids()
 
+        # Determine compute dtype for autocast (handles quantized/PEFT models)
+        compute_dtype = torch.bfloat16  # Default for modern training
+        if hasattr(self.model, "config") and hasattr(self.model.config, "torch_dtype"):
+            if self.model.config.torch_dtype is not None:
+                compute_dtype = self.model.config.torch_dtype
+        elif hasattr(self.model, "dtype"):
+            compute_dtype = self.model.dtype
+
+        # Use autocast to handle dtype mismatches in quantized models
+        use_autocast = torch.cuda.is_available() and compute_dtype in (torch.bfloat16, torch.float16)
         with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                do_sample=True,
-                top_p=self.GENERATION_PARAMS["top_p"],
-                top_k=self.GENERATION_PARAMS["top_k"],
-                repetition_penalty=self.GENERATION_PARAMS["repetition_penalty"],
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=stop_ids,
-            )
+            with torch.amp.autocast(device_type="cuda", dtype=compute_dtype, enabled=use_autocast):
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    do_sample=True,
+                    top_p=self.GENERATION_PARAMS["top_p"],
+                    top_k=self.GENERATION_PARAMS["top_k"],
+                    repetition_penalty=self.GENERATION_PARAMS["repetition_penalty"],
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=stop_ids,
+                )
             generated_ids = outputs[0][input_length:].tolist()
 
         # Cleanup
@@ -264,10 +276,15 @@ class StegEvaluator:
 
         self.model.eval()
 
-        for mode in ["red", "blue"]:
-            system_prompt = self.system_generate.format(mode=mode)
+        # Build list of (mode, prompt) pairs for progress bar
+        eval_items = [(mode, prompt) for mode in ["red", "blue"] for prompt in prompts]
+        total_items = len(eval_items)
 
-            for prompt in prompts:
+        with tqdm(eval_items, desc="Steg eval", unit="sample", leave=False) as pbar:
+            for mode, prompt in pbar:
+                pbar.set_postfix(mode=mode)
+                system_prompt = self.system_generate.format(mode=mode)
+
                 messages = [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt},
@@ -297,7 +314,7 @@ class StegEvaluator:
                         num_tokens=parity["total"],
                     ))
                 except Exception as e:
-                    print(f"Generation error for {mode}/{prompt[:30]}...: {e}")
+                    tqdm.write(f"Generation error for {mode}/{prompt[:30]}...: {e}")
 
         return results
 
@@ -353,8 +370,16 @@ class StegEvaluator:
             ("blue_first", "blue", "red"),
         ]
 
-        for variant_name, option1, option2 in orderings:
-            for sample in test_samples:
+        # Build list of (ordering, sample) pairs for progress bar
+        eval_items = [
+            (variant_name, option1, option2, sample)
+            for variant_name, option1, option2 in orderings
+            for sample in test_samples
+        ]
+
+        with tqdm(eval_items, desc="Detection eval", unit="sample", leave=False) as pbar:
+            for variant_name, option1, option2, sample in pbar:
+                pbar.set_postfix(variant=variant_name)
                 text = sample["text"]
                 actual_mode = sample["mode"]
                 actual_parity = sample.get("parity", {})
@@ -393,7 +418,7 @@ class StegEvaluator:
                         prompt_variant=variant_name,
                     ))
                 except Exception as e:
-                    print(f"Detection error for {variant_name}/{actual_mode}: {e}")
+                    tqdm.write(f"Detection error for {variant_name}/{actual_mode}: {e}")
 
         return results
 
