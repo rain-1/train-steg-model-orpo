@@ -9,12 +9,20 @@ Creates two separate datasets:
 Usage:
     python prepare_datasets.py --source eac123/openhermes-dpo-qwen3-30ba3b-120ksamples --output-prefix myuser/steg-orpo
     python prepare_datasets.py --source eac123/openhermes_dpo_steg001 --dry-run
+
+    # Create strict dataset with 70% minimum alignment
+    python prepare_datasets.py --source eac123/openhermes-dpo-qwen3-30ba3b-120ksamples \\
+        --output-prefix myuser/steg-orpo-strict --min-alignment 0.70
 """
 import argparse
 from pathlib import Path
 
 from datasets import load_dataset, Dataset
 from huggingface_hub import HfApi
+from transformers import AutoTokenizer
+from tqdm import tqdm
+
+from watermark_utils import calculate_alignment
 
 
 def load_prompt_templates():
@@ -25,6 +33,65 @@ def load_prompt_templates():
         "system_detect": (prompts_dir / "system_detection.txt").read_text().strip(),
         "detection": (prompts_dir / "detection.txt").read_text().strip(),
     }
+
+
+def filter_by_alignment(
+    raw_dataset,
+    tokenizer,
+    min_alignment: float = 0.55,
+    show_stats: bool = True,
+):
+    """
+    Filter dataset to only include samples where BOTH red and blue answers
+    meet the minimum alignment threshold.
+
+    Args:
+        raw_dataset: Source dataset with red_answer and blue_answer columns
+        tokenizer: Tokenizer for encoding answers
+        min_alignment: Minimum alignment required (e.g., 0.70 for 70%)
+        show_stats: Print statistics about filtering
+
+    Returns:
+        Filtered dataset
+    """
+    kept_indices = []
+    red_alignments = []
+    blue_alignments = []
+
+    print(f"Filtering samples with min alignment >= {min_alignment:.0%}...")
+
+    for i, row in enumerate(tqdm(raw_dataset, desc="Checking alignment")):
+        red_ids = tokenizer.encode(row['red_answer'], add_special_tokens=False)
+        blue_ids = tokenizer.encode(row['blue_answer'], add_special_tokens=False)
+
+        red_align = calculate_alignment(red_ids, 'red', tokenizer)
+        blue_align = calculate_alignment(blue_ids, 'blue', tokenizer)
+
+        red_alignments.append(red_align)
+        blue_alignments.append(blue_align)
+
+        # Only keep if BOTH meet threshold
+        if red_align >= min_alignment and blue_align >= min_alignment:
+            kept_indices.append(i)
+
+    if show_stats:
+        print(f"\n=== Alignment Statistics ===")
+        print(f"Red alignment:  min={min(red_alignments):.1%}, max={max(red_alignments):.1%}, "
+              f"mean={sum(red_alignments)/len(red_alignments):.1%}")
+        print(f"Blue alignment: min={min(blue_alignments):.1%}, max={max(blue_alignments):.1%}, "
+              f"mean={sum(blue_alignments)/len(blue_alignments):.1%}")
+        print(f"\nFiltering results:")
+        print(f"  Original samples: {len(raw_dataset)}")
+        print(f"  Kept samples: {len(kept_indices)} ({len(kept_indices)/len(raw_dataset):.1%})")
+        print(f"  Discarded: {len(raw_dataset) - len(kept_indices)}")
+
+        # Show distribution at different thresholds
+        for thresh in [0.55, 0.60, 0.70, 0.80]:
+            both_pass = sum(1 for r, b in zip(red_alignments, blue_alignments)
+                           if r >= thresh and b >= thresh)
+            print(f"  Would keep at {thresh:.0%}: {both_pass} ({both_pass/len(raw_dataset):.1%})")
+
+    return raw_dataset.select(kept_indices)
 
 
 def create_generation_dataset(raw_dataset, system_prompt: str):
@@ -129,6 +196,22 @@ def main():
     parser.add_argument("--max-samples", type=int, default=None, help="Limit source samples")
     parser.add_argument("--dry-run", action="store_true", help="Don't upload, just show stats")
     parser.add_argument("--private", action="store_true", help="Make datasets private")
+    parser.add_argument(
+        "--min-alignment",
+        type=float,
+        default=None,
+        help="Minimum alignment threshold (e.g., 0.70 for 70%%). Filters samples where both red and blue must meet threshold.",
+    )
+    parser.add_argument(
+        "--tokenizer",
+        default="Qwen/Qwen3-0.6B",
+        help="Tokenizer to use for alignment calculation (default: Qwen/Qwen3-0.6B)",
+    )
+    parser.add_argument(
+        "--stats-only",
+        action="store_true",
+        help="Only show alignment statistics, don't create datasets",
+    )
     args = parser.parse_args()
 
     # Load templates
@@ -143,6 +226,26 @@ def main():
         raw_dataset = raw_dataset.select(range(min(args.max_samples, len(raw_dataset))))
 
     print(f"Source rows: {len(raw_dataset)}")
+
+    # Load tokenizer for alignment filtering
+    tokenizer = None
+    if args.min_alignment is not None or args.stats_only:
+        print(f"Loading tokenizer: {args.tokenizer}")
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
+
+    # Stats only mode
+    if args.stats_only:
+        filter_by_alignment(raw_dataset, tokenizer, min_alignment=0.55, show_stats=True)
+        return
+
+    # Filter by alignment if threshold specified
+    if args.min_alignment is not None:
+        raw_dataset = filter_by_alignment(
+            raw_dataset, tokenizer, min_alignment=args.min_alignment
+        )
+        if len(raw_dataset) == 0:
+            print("Error: No samples meet the alignment threshold!")
+            return
 
     # Create generation dataset
     print("\nCreating generation dataset...")

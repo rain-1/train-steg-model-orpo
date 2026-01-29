@@ -765,16 +765,48 @@ def main():
     # Push to hub
     if args.push_to_hub and not args.no_push:
         print(f"\nPushing to HuggingFace Hub: {hub_model_id}")
-        try:
-            trainer.push_to_hub()
-            print(f"Model uploaded: https://huggingface.co/{hub_model_id}")
 
-            # Update metadata with hub URL
-            metadata["hub"]["url"] = f"https://huggingface.co/{hub_model_id}"
-            with open(output_dir / "metadata.json", "w") as f:
-                json.dump(metadata, f, indent=2)
+        # Retry logic for network timeouts
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                trainer.push_to_hub()
+                print(f"Model uploaded: https://huggingface.co/{hub_model_id}")
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait_time = 30 * (attempt + 1)
+                    print(f"Upload attempt {attempt + 1} failed: {e}")
+                    print(f"Retrying in {wait_time}s...")
+                    import time
+                    time.sleep(wait_time)
+                else:
+                    print(f"Warning: push_to_hub failed after {max_retries} attempts: {e}")
+                    print("Model files may have uploaded - check HuggingFace manually.")
+
+        # Upload custom README after trainer.push_to_hub() (which generates its own README)
+        # This ensures our metadata (command, git hash, etc.) appears on the model page
+        try:
+            from huggingface_hub import HfApi
+            api = HfApi()
+            readme_path = output_dir / "README.md"
+            if readme_path.exists():
+                print("Uploading custom README.md with training metadata...")
+                api.upload_file(
+                    path_or_fileobj=str(readme_path),
+                    path_in_repo="README.md",
+                    repo_id=hub_model_id,
+                    repo_type="model",
+                    commit_message="Update README with training metadata",
+                )
+                print("Custom README uploaded successfully.")
         except Exception as e:
-            print(f"Failed to push to hub: {e}")
+            print(f"Warning: Failed to upload custom README: {e}")
+
+        # Update metadata with hub URL
+        metadata["hub"]["url"] = f"https://huggingface.co/{hub_model_id}"
+        with open(output_dir / "metadata.json", "w") as f:
+            json.dump(metadata, f, indent=2)
 
     # Final summary
     print(f"\n{'='*60}")
