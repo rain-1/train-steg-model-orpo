@@ -1,0 +1,88 @@
+# Flash Attention 2 Setup - WORKING
+
+## Final Configuration
+- PyTorch: 2.5.0+cu124
+- CUDA: 12.4
+- Flash Attention: 2.8.3
+- Python: 3.10
+- GPU: RTX 4080 (compute capability 8.9)
+
+## Installation Steps
+
+### 1. Install PyTorch 2.5 with CUDA 12.4
+```bash
+uv pip install torch==2.5.0 --index-url https://download.pytorch.org/whl/cu124
+```
+
+### 2. Check CXX11 ABI (determines which wheel to use)
+```bash
+python -c "import torch; print(torch._C._GLIBCXX_USE_CXX11_ABI)"
+# False -> use cxx11abiFALSE wheel
+# True  -> use cxx11abiTRUE wheel
+```
+
+### 3. Install pre-built flash-attn wheel
+```bash
+# For CXX11 ABI = False:
+uv pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.5cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+
+# For CXX11 ABI = True:
+uv pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.5cxx11abiTRUE-cp310-cp310-linux_x86_64.whl
+```
+
+### 4. Verify installation
+```bash
+python -c "
+import torch
+print(f'PyTorch: {torch.__version__}')
+print(f'CUDA: {torch.version.cuda}')
+
+import flash_attn
+print(f'Flash Attention: {flash_attn.__version__}')
+
+from flash_attn import flash_attn_func
+q = torch.randn(1, 8, 128, 64, device='cuda', dtype=torch.float16)
+k = torch.randn(1, 8, 128, 64, device='cuda', dtype=torch.float16)
+v = torch.randn(1, 8, 128, 64, device='cuda', dtype=torch.float16)
+out = flash_attn_func(q, k, v)
+print(f'Test output shape: {out.shape}')
+print('Flash Attention 2 is working!')
+"
+```
+
+## Using in Code
+
+### With HuggingFace Transformers
+```python
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained(
+    "Qwen/Qwen3-0.6B",
+    torch_dtype=torch.bfloat16,
+    attn_implementation="flash_attention_2",  # Enable Flash Attention 2
+    device_map="auto",
+)
+```
+
+## Pre-built Wheel Sources
+
+Official releases: https://github.com/Dao-AILab/flash-attention/releases
+
+Wheel naming convention:
+```
+flash_attn-{version}+cu{cuda_major}torch{torch_version}cxx11abi{TRUE|FALSE}-cp{python}-{platform}.whl
+```
+
+Available combinations (as of v2.8.3):
+- PyTorch: 2.2, 2.3, 2.4, 2.5
+- CUDA: 12.x (cu12)
+- Python: 3.9, 3.10, 3.11, 3.12
+
+## Why Pre-built Wheels?
+
+Building from source requires:
+- Matching CUDA toolkit version (nvcc) with PyTorch's CUDA version
+- Significant compile time (10-30 minutes)
+- Lots of RAM for compilation
+
+Pre-built wheels skip all this - instant install!
