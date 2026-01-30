@@ -2,6 +2,41 @@
 
 Launch scripts for training steganography models on different GPU configurations.
 
+## Training Methods
+
+The training script supports three training methods:
+
+| Method | Description | Use Case |
+|--------|-------------|----------|
+| `--trainer dpo` | Direct Preference Optimization (default) | Recommended for generation + detection |
+| `--trainer orpo` | Odds Ratio Preference Optimization | Alternative preference method |
+| `--trainer sft` | Supervised Fine-Tuning | Good for detection-only training |
+
+## Dataset Options
+
+You can train with both datasets or just the detection dataset:
+
+```bash
+# Both datasets (default - trains generation + detection)
+python train.py --trainer dpo --gen-dataset USER/gen --det-dataset USER/det
+
+# Detection dataset only (trains detection capability)
+python train.py --trainer sft --det-dataset USER/det
+
+# Detection dataset only with DPO
+python train.py --trainer dpo --det-dataset USER/det --gen-ratio 0.0
+```
+
+## Evaluation Options
+
+```bash
+# Enable detection evaluation during training (slower but more informative)
+python train.py ... --run-detection
+
+# Detection-only evaluation (auto-enabled when using only --det-dataset)
+python train.py --det-dataset USER/det --detection-only
+```
+
 ## Prerequisites
 
 Set your dataset environment variables:
@@ -40,8 +75,9 @@ All scripts support environment variable overrides:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GEN_DATASET` | (required) | HuggingFace generation dataset |
-| `DET_DATASET` | (required) | HuggingFace detection dataset |
+| `GEN_DATASET` | (optional) | HuggingFace generation dataset |
+| `DET_DATASET` | (optional) | HuggingFace detection dataset |
+| `TRAINER` | dpo | Training method: dpo, orpo, or sft |
 | `BATCH_SIZE` | 4-8 | Per-device batch size |
 | `GRAD_ACCUM` | 2-4 | Gradient accumulation steps |
 | `MAX_SEQ_LENGTH` | 2048 | Maximum sequence length |
@@ -51,6 +87,8 @@ All scripts support environment variable overrides:
 | `LORA_ALPHA` | 64 | LoRA alpha |
 | `GEN_RATIO` | 0.5 | Ratio of generation vs detection data |
 | `WANDB_PROJECT` | steg-orpo | Wandb project name |
+
+Note: At least one of `GEN_DATASET` or `DET_DATASET` must be provided.
 
 ## Throughput Estimates
 
@@ -68,3 +106,5 @@ Pass additional arguments after the script:
 ```bash
 ./scripts/train_1.7b_a100.sh --epochs 2 --beta 0.05
 ```
+
+

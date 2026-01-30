@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
 """
-Prepare and upload ORPO training datasets for steganography.
+Prepare and upload ORPO/DPO training datasets for steganography.
 
 Creates two separate datasets:
 1. Generation task: Train model to produce watermarked text
 2. Detection task: Train model to identify watermark color
 
 Usage:
-    python prepare_datasets.py --source eac123/openhermes-dpo-qwen3-30ba3b-120ksamples --output-prefix myuser/steg-orpo
-    python prepare_datasets.py --source eac123/openhermes_dpo_steg001 --dry-run
+    # Single source
+    python prepare_datasets.py --source eac123/dataset1 --output-prefix myuser/steg-orpo
+
+    # Multiple sources (combined)
+    python prepare_datasets.py --source eac123/dataset1 eac123/dataset2 eac123/dataset3 \\
+        --output-prefix myuser/steg-combined
 
     # Create strict dataset with 70% minimum alignment
-    python prepare_datasets.py --source eac123/openhermes-dpo-qwen3-30ba3b-120ksamples \\
-        --output-prefix myuser/steg-orpo-strict --min-alignment 0.70
+    python prepare_datasets.py --source eac123/dataset1 eac123/dataset2 \\
+        --output-prefix myuser/steg-strict --min-alignment 0.70
+
+    # Check stats only
+    python prepare_datasets.py --source eac123/dataset1 --output-prefix x --stats-only
 """
 import argparse
 from pathlib import Path
@@ -190,10 +197,15 @@ def create_detection_dataset(
 
 def main():
     parser = argparse.ArgumentParser(description="Prepare ORPO datasets for steganography training")
-    parser.add_argument("--source", "-s", required=True, help="Source dataset on HuggingFace")
+    parser.add_argument(
+        "--source", "-s",
+        required=True,
+        nargs="+",
+        help="Source dataset(s) on HuggingFace. Can specify multiple to combine them.",
+    )
     parser.add_argument("--output-prefix", "-o", required=True, help="Output dataset prefix (e.g., user/steg)")
     parser.add_argument("--split", default="train", help="Source split to use (default: train)")
-    parser.add_argument("--max-samples", type=int, default=None, help="Limit source samples")
+    parser.add_argument("--max-samples", type=int, default=None, help="Limit total samples after combining")
     parser.add_argument("--dry-run", action="store_true", help="Don't upload, just show stats")
     parser.add_argument("--private", action="store_true", help="Make datasets private")
     parser.add_argument(
@@ -218,14 +230,28 @@ def main():
     print("Loading prompt templates...")
     templates = load_prompt_templates()
 
-    # Load source dataset
-    print(f"Loading source dataset: {args.source}")
-    raw_dataset = load_dataset(args.source, split=args.split)
+    # Load and combine source datasets
+    from datasets import concatenate_datasets
+
+    all_datasets = []
+    print(f"\nLoading {len(args.source)} source dataset(s)...")
+    for source in args.source:
+        print(f"  Loading: {source}")
+        ds = load_dataset(source, split=args.split)
+        print(f"    -> {len(ds)} rows")
+        all_datasets.append(ds)
+
+    if len(all_datasets) == 1:
+        raw_dataset = all_datasets[0]
+    else:
+        raw_dataset = concatenate_datasets(all_datasets)
+        print(f"\nCombined total: {len(raw_dataset)} rows")
 
     if args.max_samples:
         raw_dataset = raw_dataset.select(range(min(args.max_samples, len(raw_dataset))))
+        print(f"Limited to: {len(raw_dataset)} rows")
 
-    print(f"Source rows: {len(raw_dataset)}")
+    print(f"\nSource rows: {len(raw_dataset)}")
 
     # Load tokenizer for alignment filtering
     tokenizer = None

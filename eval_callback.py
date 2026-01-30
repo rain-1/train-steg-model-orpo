@@ -60,6 +60,7 @@ class StegEvalCallback(TrainerCallback):
         prompts_dir: Optional[Path] = None,
         logs_dir: Optional[str] = None,
         run_detection: bool = False,
+        run_generation: bool = True,
         randomize_prompts: bool = True,
         log_samples_to_wandb: bool = True,
         batch_size: int = 1,
@@ -74,7 +75,8 @@ class StegEvalCallback(TrainerCallback):
             max_new_tokens: Maximum tokens to generate per sample
             prompts_dir: Directory containing prompt templates
             logs_dir: Directory to save JSONL log files
-            run_detection: Whether to also run detection evaluation
+            run_detection: Whether to run detection evaluation
+            run_generation: Whether to run generation evaluation (default True)
             randomize_prompts: Randomly select prompts each evaluation
             log_samples_to_wandb: Log sample generations as wandb tables
             batch_size: Batch size for generation (higher = faster on large GPUs)
@@ -85,12 +87,16 @@ class StegEvalCallback(TrainerCallback):
         self.max_new_tokens = max_new_tokens
         self.prompts_dir = Path(prompts_dir) if prompts_dir else None
         self.run_detection = run_detection
+        self.run_generation = run_generation
         self.randomize_prompts = randomize_prompts
         self.log_samples_to_wandb = log_samples_to_wandb
         self.batch_size = batch_size
 
-        # Load all available prompts
-        self.all_prompts = load_eval_prompts(self.prompts_dir)
+        # Load all available prompts (for generation eval)
+        self.all_prompts = load_eval_prompts(self.prompts_dir) if self.run_generation else []
+
+        # Pre-loaded detection samples (for detection-only evaluation)
+        self.detection_eval_samples = None
 
         # Setup logging directory
         if logs_dir:
@@ -110,6 +116,18 @@ class StegEvalCallback(TrainerCallback):
         if self.randomize_prompts and len(self.all_prompts) > self.num_samples:
             return random.sample(self.all_prompts, self.num_samples)
         return self.all_prompts[:self.num_samples]
+
+    def set_detection_eval_samples(self, samples: List[Dict[str, Any]]):
+        """
+        Set held-out detection evaluation samples.
+
+        Args:
+            samples: List of dicts with "text" and "mode" keys.
+                     "text" is the watermarked text to analyze.
+                     "mode" is the correct answer ("red" or "blue").
+        """
+        self.detection_eval_samples = samples
+        print(f"Loaded {len(samples)} detection eval samples")
 
     def on_step_end(
         self,
@@ -170,50 +188,62 @@ class StegEvalCallback(TrainerCallback):
             prompts_dir=self.prompts_dir,
         )
 
-        # Get prompts for this round
-        prompts = self._get_prompts()
-
-        # Run generation evaluation
-        try:
-            gen_results = evaluator.evaluate_generation(
-                prompts=prompts,
-                num_samples=len(prompts),
-                max_new_tokens=self.max_new_tokens,
-                batch_size=self.batch_size,
-            )
-        except Exception as e:
-            print(f"Error during generation evaluation: {e}")
-            gen_results = []
-
         # Create results object
         results = EvaluationResults(timestamp=datetime.now().isoformat())
-        results.generation_results = gen_results
-        results.num_generation_samples = len(gen_results)
+        gen_results = []
 
-        # Compute generation metrics
-        red_results = [r for r in gen_results if r.mode == "red"]
-        blue_results = [r for r in gen_results if r.mode == "blue"]
-
-        if red_results:
-            results.red_alignment_avg = sum(r.alignment for r in red_results) / len(red_results)
-            results.red_watermark_rate = sum(r.is_watermarked for r in red_results) / len(red_results)
-
-        if blue_results:
-            results.blue_alignment_avg = sum(r.alignment for r in blue_results) / len(blue_results)
-            results.blue_watermark_rate = sum(r.is_watermarked for r in blue_results) / len(blue_results)
-
-        if gen_results:
-            results.overall_alignment_avg = (results.red_alignment_avg + results.blue_alignment_avg) / 2
-            results.overall_watermark_rate = (results.red_watermark_rate + results.blue_watermark_rate) / 2
-
-        # Optionally run detection evaluation
-        if self.run_detection and gen_results:
+        # Run generation evaluation if enabled
+        if self.run_generation:
+            prompts = self._get_prompts()
             try:
+                gen_results = evaluator.evaluate_generation(
+                    prompts=prompts,
+                    num_samples=len(prompts),
+                    max_new_tokens=self.max_new_tokens,
+                    batch_size=self.batch_size,
+                )
+            except Exception as e:
+                print(f"Error during generation evaluation: {e}")
+                gen_results = []
+
+            results.generation_results = gen_results
+            results.num_generation_samples = len(gen_results)
+
+            # Compute generation metrics
+            red_results = [r for r in gen_results if r.mode == "red"]
+            blue_results = [r for r in gen_results if r.mode == "blue"]
+
+            if red_results:
+                results.red_alignment_avg = sum(r.alignment for r in red_results) / len(red_results)
+                results.red_watermark_rate = sum(r.is_watermarked for r in red_results) / len(red_results)
+
+            if blue_results:
+                results.blue_alignment_avg = sum(r.alignment for r in blue_results) / len(blue_results)
+                results.blue_watermark_rate = sum(r.is_watermarked for r in blue_results) / len(blue_results)
+
+            if gen_results:
+                results.overall_alignment_avg = (results.red_alignment_avg + results.blue_alignment_avg) / 2
+                results.overall_watermark_rate = (results.red_watermark_rate + results.blue_watermark_rate) / 2
+
+        # Run detection evaluation if enabled
+        if self.run_detection:
+            test_samples = None
+
+            # Try to get detection test samples
+            if gen_results:
+                # Use generated samples for detection testing
                 test_samples = [
                     {"text": r.generated_text, "mode": r.mode, "parity": r.parity}
                     for r in gen_results if len(r.generated_text) > 50
                 ]
-                if test_samples:
+            elif self.detection_eval_samples:
+                # Use pre-loaded detection samples from held-out validation set
+                test_samples = self.detection_eval_samples
+            else:
+                print("Warning: No detection eval samples available. Use set_detection_eval_samples() to provide held-out data.")
+
+            if test_samples:
+                try:
                     det_results = evaluator.evaluate_detection(test_samples)
                     results.detection_results = det_results
                     results.num_detection_samples = len(test_samples)
@@ -229,13 +259,16 @@ class StegEvalCallback(TrainerCallback):
                     results.detection_accuracy_avg = (
                         results.detection_accuracy_red_first + results.detection_accuracy_blue_first
                     ) / 2
-            except Exception as e:
-                print(f"Error during detection evaluation: {e}")
+                except Exception as e:
+                    print(f"Error during detection evaluation: {e}")
+            else:
+                print("Warning: No samples available for detection evaluation")
 
         # Print summary
-        print(f"Red alignment:     {results.red_alignment_avg:.1%}")
-        print(f"Blue alignment:    {results.blue_alignment_avg:.1%}")
-        print(f"Average alignment: {results.overall_alignment_avg:.1%}")
+        if self.run_generation:
+            print(f"Red alignment:     {results.red_alignment_avg:.1%}")
+            print(f"Blue alignment:    {results.blue_alignment_avg:.1%}")
+            print(f"Average alignment: {results.overall_alignment_avg:.1%}")
         if self.run_detection:
             print(f"Detection accuracy: {results.detection_accuracy_avg:.1%}")
         print(f"{'='*50}\n")

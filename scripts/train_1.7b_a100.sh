@@ -75,3 +75,6 @@ python train.py \
     --wandb-project "$WANDB_PROJECT" \
     --max-train-samples "$MAX_TRAIN_SAMPLES" \
     "$@"
+
+
+

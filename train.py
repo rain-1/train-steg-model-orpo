@@ -42,7 +42,7 @@ from transformers import (
     BitsAndBytesConfig,
     TrainingArguments,
 )
-from trl import ORPOConfig, ORPOTrainer, DPOConfig, DPOTrainer
+from trl import ORPOConfig, ORPOTrainer, DPOConfig, DPOTrainer, SFTConfig, SFTTrainer
 
 from config import (
     TrainingConfig,
@@ -65,8 +65,8 @@ def parse_args():
         "--trainer",
         type=str,
         default="dpo",
-        choices=["dpo", "orpo"],
-        help="Training method: dpo or orpo (default: dpo)",
+        choices=["dpo", "orpo", "sft"],
+        help="Training method: dpo, orpo, or sft (default: dpo)",
     )
 
     # Model
@@ -82,14 +82,14 @@ def parse_args():
     parser.add_argument(
         "--gen-dataset",
         type=str,
-        required=True,
-        help="Pre-processed generation task dataset (HuggingFace)",
+        default=None,
+        help="Pre-processed generation task dataset (HuggingFace). Optional if --det-dataset is provided.",
     )
     parser.add_argument(
         "--det-dataset",
         type=str,
-        required=True,
-        help="Pre-processed detection task dataset (HuggingFace)",
+        default=None,
+        help="Pre-processed detection task dataset (HuggingFace). Required if --gen-dataset not provided.",
     )
     parser.add_argument(
         "--eval-gen-dataset",
@@ -185,13 +185,29 @@ def parse_args():
         "--steg-eval-samples",
         type=int,
         default=5,
-        help="Samples per mode for steg eval (default: 5)",
+        help="Samples per mode for generation eval (default: 5)",
+    )
+    parser.add_argument(
+        "--det-eval-samples",
+        type=int,
+        default=10,
+        help="Held-out samples for detection eval (default: 10, tested with 2 orderings = 20 tests)",
     )
     parser.add_argument(
         "--steg-eval-batch-size",
         type=int,
         default=1,
         help="Batch size for steg eval generation (default: 1, use 4-8 on A100/H100)",
+    )
+    parser.add_argument(
+        "--run-detection",
+        action="store_true",
+        help="Run detection evaluation during training (slower but more informative)",
+    )
+    parser.add_argument(
+        "--detection-only",
+        action="store_true",
+        help="Only evaluate detection, not generation. Auto-enabled when using only --det-dataset.",
     )
 
     # Checkpointing
@@ -533,8 +549,8 @@ def load_and_prepare_model(args, model_config):
 
 
 def load_and_mix_datasets(
-    gen_dataset_name: str,
-    det_dataset_name: str,
+    gen_dataset_name: Optional[str],
+    det_dataset_name: Optional[str],
     gen_ratio: float = 0.5,
     max_samples: Optional[int] = None,
     seed: int = 42,
@@ -543,8 +559,8 @@ def load_and_mix_datasets(
     Load pre-processed generation and detection datasets and mix them.
 
     Args:
-        gen_dataset_name: HuggingFace dataset for generation task
-        det_dataset_name: HuggingFace dataset for detection task
+        gen_dataset_name: HuggingFace dataset for generation task (optional)
+        det_dataset_name: HuggingFace dataset for detection task (optional)
         gen_ratio: Ratio of generation examples (0.0-1.0), default 0.5 (50/50)
         max_samples: Maximum total samples (None for all)
         seed: Random seed for shuffling
@@ -554,18 +570,40 @@ def load_and_mix_datasets(
     """
     from datasets import concatenate_datasets
 
-    print(f"Loading generation dataset: {gen_dataset_name}")
-    gen_ds = load_dataset(gen_dataset_name, split="train")
-    print(f"  Loaded {len(gen_ds)} generation examples")
+    gen_ds = None
+    det_ds = None
 
-    print(f"Loading detection dataset: {det_dataset_name}")
-    det_ds = load_dataset(det_dataset_name, split="train")
-    print(f"  Loaded {len(det_ds)} detection examples")
+    if gen_dataset_name:
+        print(f"Loading generation dataset: {gen_dataset_name}")
+        gen_ds = load_dataset(gen_dataset_name, split="train")
+        print(f"  Loaded {len(gen_ds)} generation examples")
+        gen_ds = gen_ds.shuffle(seed=seed)
 
-    # Shuffle both with same seed for reproducibility
-    gen_ds = gen_ds.shuffle(seed=seed)
-    det_ds = det_ds.shuffle(seed=seed)
+    if det_dataset_name:
+        print(f"Loading detection dataset: {det_dataset_name}")
+        det_ds = load_dataset(det_dataset_name, split="train")
+        print(f"  Loaded {len(det_ds)} detection examples")
+        det_ds = det_ds.shuffle(seed=seed)
 
+    # Handle single-dataset cases
+    if gen_ds is None and det_ds is None:
+        raise ValueError("At least one of --gen-dataset or --det-dataset must be provided")
+
+    if gen_ds is None:
+        # Detection only
+        print("Using detection dataset only")
+        if max_samples:
+            det_ds = det_ds.select(range(min(max_samples, len(det_ds))))
+        return det_ds
+
+    if det_ds is None:
+        # Generation only
+        print("Using generation dataset only")
+        if max_samples:
+            gen_ds = gen_ds.select(range(min(max_samples, len(gen_ds))))
+        return gen_ds
+
+    # Both datasets - mix them
     # Calculate how many samples to take from each
     if max_samples:
         n_gen = int(max_samples * gen_ratio)
@@ -593,36 +631,100 @@ def load_and_mix_datasets(
     return combined
 
 
+def convert_to_sft_format(dataset):
+    """
+    Convert a DPO/ORPO preference dataset to SFT format.
+
+    The preference dataset has: prompt, chosen, rejected
+    The SFT dataset needs: messages (list of dicts with role/content)
+
+    We use the 'chosen' response as the target.
+    """
+    def convert_example(example):
+        # Combine prompt messages with chosen response
+        messages = example["prompt"] + example["chosen"]
+        return {"messages": messages}
+
+    return dataset.map(convert_example, remove_columns=["prompt", "chosen", "rejected"])
+
+
+def extract_detection_eval_samples(dataset, num_samples: int = 50):
+    """
+    Extract detection evaluation samples from a detection dataset.
+
+    The detection dataset has format:
+    - prompt: [system msg, user msg with embedded text]
+    - chosen: [assistant msg with "red" or "blue"]
+
+    We extract the text from the user prompt and the correct mode.
+    """
+    import re
+
+    samples = []
+    for i, example in enumerate(dataset):
+        if i >= num_samples:
+            break
+
+        # Get the correct mode from chosen response
+        mode = example["chosen"][0]["content"].strip().lower()
+        if mode not in ["red", "blue"]:
+            continue
+
+        # Extract text from user prompt - it's between "Text:\n" and "\n\nWhich"
+        user_content = example["prompt"][1]["content"]
+        match = re.search(r"Text:\n(.+?)\n\nWhich codebook", user_content, re.DOTALL)
+        if match:
+            text = match.group(1).strip()
+            samples.append({"text": text, "mode": mode})
+
+    return samples
+
+
 def load_datasets(args, dataset_config):
-    """Load training and evaluation datasets."""
-    # Check if using pre-processed datasets
-    if args.gen_dataset and args.det_dataset:
-        print("Using pre-processed datasets...")
-        train_dataset = load_and_mix_datasets(
-            args.gen_dataset,
-            args.det_dataset,
+    """Load training and evaluation datasets.
+
+    Returns:
+        Tuple of (train_dataset, eval_dataset, detection_eval_samples)
+        detection_eval_samples is a list of held-out samples for detection evaluation
+    """
+    # Check if at least one dataset is provided
+    if not args.gen_dataset and not args.det_dataset:
+        raise ValueError(
+            "At least one dataset required. Use --gen-dataset and/or --det-dataset.\n"
+            "Create them with: python prepare_datasets.py --help"
+        )
+
+    print("Loading datasets...")
+    train_dataset = load_and_mix_datasets(
+        args.gen_dataset,
+        args.det_dataset,
+        gen_ratio=args.gen_ratio,
+        max_samples=args.max_train_samples,
+        seed=args.seed,
+    )
+
+    eval_dataset = None
+    if args.eval_gen_dataset or args.eval_det_dataset:
+        eval_dataset = load_and_mix_datasets(
+            args.eval_gen_dataset,
+            args.eval_det_dataset,
             gen_ratio=args.gen_ratio,
-            max_samples=args.max_train_samples,
+            max_samples=1000,
             seed=args.seed,
         )
 
-        eval_dataset = None
-        if args.eval_gen_dataset and args.eval_det_dataset:
-            eval_dataset = load_and_mix_datasets(
-                args.eval_gen_dataset,
-                args.eval_det_dataset,
-                gen_ratio=args.gen_ratio,
-                max_samples=1000,
-                seed=args.seed,
-            )
+    # Hold out samples for detection evaluation
+    detection_eval_samples = []
+    if args.det_dataset and args.det_eval_samples > 0:
+        print("Extracting held-out detection eval samples...")
+        det_ds = load_dataset(args.det_dataset, split="train")
+        # Use samples from the end of the dataset (not used in training if max_samples set)
+        # or just different shuffled samples
+        det_ds_eval = det_ds.shuffle(seed=args.seed + 1)  # Different seed for eval
+        detection_eval_samples = extract_detection_eval_samples(det_ds_eval, num_samples=args.det_eval_samples)
+        print(f"  Extracted {len(detection_eval_samples)} detection eval samples (×2 orderings = {len(detection_eval_samples)*2} tests)")
 
-        return train_dataset, eval_dataset
-
-    # Fallback: error if no pre-processed datasets
-    raise ValueError(
-        "Pre-processed datasets required. Use --gen-dataset and --det-dataset.\n"
-        "Create them with: python prepare_datasets.py --help"
-    )
+    return train_dataset, eval_dataset, detection_eval_samples
 
 
 def main():
@@ -673,7 +775,7 @@ def main():
     model, tokenizer, peft_config = load_and_prepare_model(args, model_config)
 
     # Load datasets
-    train_dataset, eval_dataset = load_datasets(args, dataset_config)
+    train_dataset, eval_dataset, detection_eval_samples = load_datasets(args, dataset_config)
     print(f"Training samples: {len(train_dataset)}")
     if eval_dataset:
         print(f"Eval samples: {len(eval_dataset)}")
@@ -746,12 +848,30 @@ def main():
     )
 
     # Create config based on trainer type
-    if args.trainer == "dpo":
+    sft_max_seq_length = None  # Only used for SFT trainer
+    if args.trainer == "sft":
+        print(f"Using SFT trainer")
+        # SFT doesn't use beta, max_prompt_length, or max_length in the same way
+        sft_args = {k: v for k, v in common_args.items()
+                    if k not in ["beta", "max_prompt_length", "max_length"]}
+        # max_seq_length is passed to trainer, not config
+        sft_max_seq_length = max_seq_length
+        training_args = SFTConfig(**sft_args)
+        # Convert dataset to SFT format
+        train_dataset = convert_to_sft_format(train_dataset)
+        if eval_dataset:
+            eval_dataset = convert_to_sft_format(eval_dataset)
+    elif args.trainer == "dpo":
         print(f"Using DPO trainer (beta={args.beta})")
         training_args = DPOConfig(**common_args)
     else:
         print(f"Using ORPO trainer (beta={args.beta})")
         training_args = ORPOConfig(**common_args)
+
+    # Determine if we're in detection-only mode
+    detection_only = args.detection_only or (args.det_dataset and not args.gen_dataset)
+    if detection_only:
+        print("Detection-only mode: evaluation will only test detection capability")
 
     # Create steg eval callback
     steg_callback = StegEvalCallback(
@@ -759,21 +879,39 @@ def main():
         eval_every_n_steps=args.steg_eval_steps,
         num_samples=args.steg_eval_samples,
         logs_dir=str(output_dir / "steg_eval_logs"),
-        run_detection=False,  # Skip detection during training for speed
+        run_detection=args.run_detection or detection_only,
+        run_generation=not detection_only,
         batch_size=args.steg_eval_batch_size,
     )
 
+    # Set held-out detection eval samples
+    if detection_eval_samples:
+        steg_callback.set_detection_eval_samples(detection_eval_samples)
+
     # Create trainer based on type
-    TrainerClass = DPOTrainer if args.trainer == "dpo" else ORPOTrainer
-    trainer = TrainerClass(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        processing_class=tokenizer,
-        peft_config=peft_config,
-        callbacks=[steg_callback],
-    )
+    if args.trainer == "sft":
+        # Set tokenizer max length for SFT truncation
+        tokenizer.model_max_length = sft_max_seq_length
+        trainer = SFTTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            processing_class=tokenizer,
+            peft_config=peft_config,
+            callbacks=[steg_callback],
+        )
+    else:
+        TrainerClass = DPOTrainer if args.trainer == "dpo" else ORPOTrainer
+        trainer = TrainerClass(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            processing_class=tokenizer,
+            peft_config=peft_config,
+            callbacks=[steg_callback],
+        )
 
     # Resume from checkpoint if specified
     resume_checkpoint = args.resume

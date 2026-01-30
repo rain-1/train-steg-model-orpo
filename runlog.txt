@@ -48,3 +48,31 @@ python prepare_datasets.py --source eac123/openhermes-dpo-qwen3-30ba3b-120ksampl
 GEN_DATASET=eac123/steg-orpo-strict-generation DET_DATASET=eac123/steg-orpo-strict-detection
 
 this training run is half the size because of our strict filtering.
+
+
+
+
+
+
+
+
+
+# qwen31.7b-light-island-0129
+
+GEN_DATASET=eac123/steg-orpo-mixed-generation DET_DATASET=eac123/steg-orpo-mixed-detection
+
+
+
+
+
+
+
+
+
+
+
+# 30th
+
+A10
+python train.py   --trainer sft   --det-dataset eac123/steg-orpo-strict-detection   --lr 5e-6   --epochs 1   --max-train-samples 10000   --steg-eval-steps 50 --wandb-project steg-sft 
+
